@@ -32,9 +32,10 @@
 #include <string>
 #include <vector>
 
-#define YUE2_NAR_GRAPH_NODES 8192
+#define YUE2_NAR_GRAPH_NODES (8192 + 16 * 2048)  // HERESY 1447: and room for the LoRAs that run with the graph
 #define YUE2_TIME_EMBED_DIM  256
 #define YUE2_NAR_MASK_PAD    64
+#define YUE2_NAR_KV_PAD      256  // Local addition: see nar_kv_pad()
 
 // Named probes of the velocity graph, read by the cossim harness: the key
 // depths of the latent block and the layer 0 attention output
@@ -44,6 +45,7 @@ struct Yue2NAR {
     Qwen3LMConfig cfg;  // the backbone config, shared with the AR half
     bool          use_flash_attn;
     bool          clamp_fp16;
+    bool          pad_kv;  // Local addition: pad the attention keys to a multiple of 256 (CUDA)
 
     int   latent_dim;
     float timestep_shift;
@@ -75,6 +77,10 @@ struct Yue2NAR {
     int                  graph_M;     // cached variation count
     int                  graph_ar;    // cached ar_len
     int                  graph_set;   // cached KV set
+
+    // HERESY 1447: the LoRAs that run with the graph (lora-rt.h), NULL otherwise; the graph is built anew at every
+    // evaluation, so a set attached or changed between chunks is read at the next one
+    const LoraRtSet * lora_rt = nullptr;
 
     std::vector<float>   scratch_x;
     std::vector<float>   scratch_pos_emb;
@@ -141,6 +147,7 @@ static bool nar_load(Yue2NAR * n, const char * gguf_path, const std::vector<Adap
     n->cpu_backend    = bp.cpu_backend;
     n->sched          = backend_sched_new(bp, YUE2_NAR_GRAPH_NODES);
     n->use_flash_attn = bp.has_gpu;
+    n->pad_kv         = strncmp(ggml_backend_name(bp.backend), "CUDA", 4) == 0;
 
     // layers * 11 + vae2llm(2) + llm2vae(2) + time embedder(4)
     if (!graph_arena_init(&n->arena, YUE2_NAR_GRAPH_NODES)) {
@@ -225,6 +232,19 @@ static struct ggml_tensor * nar_linear_bias(struct ggml_context * ctx,
     return ggml_add(ctx, ggml_mul_mat(ctx, w, x), b);
 }
 
+// Local addition: masked zero key rows after the latent block, so the key count
+// is a multiple of 256. CUDA flash attention takes its grouped-query path (both
+// query heads of a KV head on one K/V tile) only then; otherwise every query
+// head reads K and V again. The mask hides the extra rows. Measured: on an RTX
+// 2070 the same bytes, attention per layer 55 -> 29 ms; on an RTX 5090 a step
+// 690 -> 443 ms on a 242 s song, and not the same bytes (that path adds up in
+// another order): spectrum similarity 0.99998 to before. Only on CUDA: other
+// backends would just attend over more masked keys.
+static int nar_kv_pad(int ar_len, int N) {
+    int kv = ar_len + N;
+    return (kv + YUE2_NAR_KV_PAD - 1) / YUE2_NAR_KV_PAD * YUE2_NAR_KV_PAD - kv;
+}
+
 // NAR attention: fresh Q/K/V for the latent block of every variation,
 // concatenated with the AR prefix window of the cache, which every variation
 // reads. The graph only reads the cache, so there is no write to order against
@@ -234,14 +254,17 @@ static struct ggml_tensor * nar_build_attn(struct ggml_context * ctx,
                                            Qwen3Layer *          ly,
                                            struct ggml_tensor *  x,          // [H, N, M]
                                            struct ggml_tensor *  positions,  // [N]
-                                           struct ggml_tensor *  mask,       // [ar_len + N, pad(N)] f16, all zero
+                                           struct ggml_tensor *  mask,       // [ar_len + N + kv_pad, pad(N)] f16
                                            struct ggml_tensor *  cache_k,    // [D, max_seq, Nkv] f16
                                            struct ggml_tensor *  cache_v,
                                            int                   ar_len,
                                            int                   N,
                                            int                   M,
+                                           int                   kv_pad,  // Local addition: nar_kv_pad() or 0
                                            bool                  use_flash_attn,
-                                           bool                  clamp_fp16) {
+                                           bool                  clamp_fp16,
+                                           const LoraRtSet *     lora_rt = nullptr,  // HERESY 1447
+                                           int                   layer   = -1) {
     int D   = c.head_dim;
     int Nh  = c.n_heads;
     int Nkv = c.n_kv_heads;
@@ -260,6 +283,11 @@ static struct ggml_tensor * nar_build_attn(struct ggml_context * ctx,
         k = qwen3_linear(ctx, ly->k_proj, x);
         v = qwen3_linear(ctx, ly->v_proj, x);
     }
+    if (lora_rt_active(lora_rt)) {  // HERESY 1447
+        q = lora_rt_apply(ctx, lora_rt, layer, LRT_Q, x, q);
+        k = lora_rt_apply(ctx, lora_rt, layer, LRT_K, x, k);
+        v = lora_rt_apply(ctx, lora_rt, layer, LRT_V, x, v);
+    }
 
     q = ggml_reshape_4d(ctx, q, D, Nh, N, M);
     k = ggml_reshape_4d(ctx, k, D, Nkv, N, M);
@@ -276,6 +304,12 @@ static struct ggml_tensor * nar_build_attn(struct ggml_context * ctx,
     q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));  // [D, N, Nh, M]
     k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));  // [D, N, Nkv, M]
     v = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+
+    // Local addition: the masked zero rows of nar_kv_pad() after the block's own keys
+    if (kv_pad > 0) {
+        k = ggml_pad(ctx, k, 0, kv_pad, 0, 0);  // [D, N + kv_pad, Nkv, M]
+        v = ggml_pad(ctx, v, 0, kv_pad, 0, 0);
+    }
 
     // Clamp V before the F16 cast: the clamp kernels walk contiguous memory
     if (clamp_fp16) {
@@ -306,18 +340,44 @@ static struct ggml_tensor * nar_build_attn(struct ggml_context * ctx,
     }
 
     attn = ggml_reshape_3d(ctx, attn, Nh * D, N, M);
-    return qwen3_linear(ctx, ly->o_proj, attn);
+    return lora_rt_apply(ctx, lora_rt, layer, LRT_O, attn, qwen3_linear(ctx, ly->o_proj, attn));
 }
 
 // Build the velocity graph of M variations of a T_lat frame block over the
 // AR prefix of KV set kv_set. The frame inputs hold for a shape (T_lat,
 // ar_len), the graph itself is rebuilt at every evaluation.
+// HERESY 1169: why the sound half stopped, in words for the job (pipeline_generate puts it in last_error)
+inline std::string g_nar_error;
+
+// HERESY 1169: out of memory. A failed allocation left the scheduler half-reserved and the next request asserted in it,
+// killing the engine with the job: a new scheduler, the inputs built anew at the next evaluation, and the reason with the
+// card's own numbers
+static void nar_out_of_memory(Yue2NAR * n, int T_lat, int M) {
+    size_t             free_b = 0, total_b = 0;
+    ggml_backend_dev_t dev    = ggml_backend_get_device(n->backend);
+    if (dev) {
+        ggml_backend_dev_memory(dev, &free_b, &total_b);
+    }
+    char msg[480];
+    snprintf(msg, sizeof msg,
+             "Out of GPU memory for the sound: %.1f of %.1f GB free when %d variation%s of %d s needed more. A smaller copy of "
+             "the model (Q8_0) or fewer probes at once leaves it room.",
+             free_b / 1073741824.0, total_b / 1073741824.0, M, M == 1 ? "" : "s", T_lat / 25);
+    g_nar_error = msg;
+    fprintf(stderr, "[NAR] %s\n", msg);
+    ggml_backend_sched_free(n->sched);
+    BackendPair bp = { n->backend, n->cpu_backend, n->use_flash_attn };
+    n->sched       = backend_sched_new(bp, YUE2_NAR_GRAPH_NODES);
+    n->graph_T     = -1;
+}
+
 static bool nar_build_graph(Yue2NAR * n, const Qw3lmKvCache * kv, int T_lat, int M, int ar_len, int kv_set) {
     bool                  new_shape = (n->graph_T != T_lat || n->graph_ar != ar_len);
     bool                  new_key   = new_shape || n->graph_M != M || n->graph_set != kv_set;
     const Qwen3LMConfig & c         = n->cfg;
     int                   H         = c.hidden_size;
     int                   N         = T_lat + 2;
+    const int             kv_pad    = n->pad_kv && n->use_flash_attn ? nar_kv_pad(ar_len, N) : 0;  // Local addition
 
     if (ar_len < 1 || ar_len + N > kv->cfg.max_seq_len) {
         fprintf(stderr, "[NAR] FATAL: prefix %d plus latent block %d exceeds the context %d\n", ar_len, N,
@@ -350,7 +410,7 @@ static bool nar_build_graph(Yue2NAR * n, const Qw3lmKvCache * kv, int T_lat, int
         n->in_pos_emb              = ggml_new_tensor_2d(n->input_ctx, GGML_TYPE_F32, H, N);
         n->in_pos                  = ggml_new_tensor_1d(n->input_ctx, GGML_TYPE_I32, N);
         int mask_rows              = (N + YUE2_NAR_MASK_PAD - 1) / YUE2_NAR_MASK_PAD * YUE2_NAR_MASK_PAD;
-        n->in_mask                 = ggml_new_tensor_2d(n->input_ctx, GGML_TYPE_F16, ar_len + N, mask_rows);
+        n->in_mask                 = ggml_new_tensor_2d(n->input_ctx, GGML_TYPE_F16, ar_len + N + kv_pad, mask_rows);
         ggml_set_name(n->in_pos_emb, "nar_pos_emb");
         ggml_set_input(n->in_pos_emb);
         ggml_set_name(n->in_pos, "nar_positions");
@@ -382,7 +442,8 @@ static bool nar_build_graph(Yue2NAR * n, const Qw3lmKvCache * kv, int T_lat, int
         Qwen3Layer *         ly   = &n->layers[l];
         struct ggml_tensor * norm = qwen3_rms_norm(ctx, hidden, ly->input_layernorm, c.rms_norm_eps);
         struct ggml_tensor * attn = nar_build_attn(ctx, c, ly, norm, n->in_pos, n->in_mask, kv->k[kv_set][l],
-                                                   kv->v[kv_set][l], ar_len, N, M, n->use_flash_attn, n->clamp_fp16);
+                                                   kv->v[kv_set][l], ar_len, N, M, kv_pad, n->use_flash_attn, n->clamp_fp16,
+                                                   n->lora_rt, l);
         if (l == 0) {
             ggml_set_name(attn, "layer0_sa_output");
             ggml_set_output(attn);
@@ -392,7 +453,8 @@ static bool nar_build_graph(Yue2NAR * n, const Qw3lmKvCache * kv, int T_lat, int
             hidden = ggml_clamp(ctx, hidden, -65504.0f, 65504.0f);
         }
         norm   = qwen3_rms_norm(ctx, hidden, ly->post_attn_layernorm, c.rms_norm_eps);
-        hidden = ggml_add(ctx, hidden, qwen3_build_mlp(ctx, ly, norm, N * M));
+        hidden = ggml_add(ctx, hidden, lora_rt_touches_mlp(n->lora_rt, l) ? lora_rt_build_mlp(ctx, ly, norm, n->lora_rt, l) :
+                                                                              qwen3_build_mlp(ctx, ly, norm, N * M));
         if (n->clamp_fp16) {
             hidden = ggml_clamp(ctx, hidden, -65504.0f, 65504.0f);
         }
@@ -433,13 +495,20 @@ static bool nar_build_graph(Yue2NAR * n, const Qw3lmKvCache * kv, int T_lat, int
         }
         ggml_backend_tensor_set(n->in_pos, n->scratch_pos.data(), 0, n->scratch_pos.size() * sizeof(int32_t));
 
-        // Every NAR query sees every key, so the additive mask is uniformly zero
-        std::vector<uint16_t> zeros((size_t) ggml_nelements(n->in_mask), 0);
-        ggml_backend_tensor_set(n->in_mask, zeros.data(), 0, zeros.size() * sizeof(uint16_t));
+        // Every NAR query sees every key, so the additive mask is uniformly zero,
+        // except on the padding keys of nar_kv_pad(), which no query sees (local addition)
+        const int64_t            keys = n->in_mask->ne[0];
+        std::vector<ggml_fp16_t> mask((size_t) ggml_nelements(n->in_mask), ggml_fp32_to_fp16(0.0f));
+        for (int64_t row = 0; kv_pad > 0 && row < n->in_mask->ne[1]; row++) {
+            for (int64_t key = ar_len + N; key < keys; key++) {
+                mask[(size_t) (row * keys + key)] = ggml_fp32_to_fp16(-INFINITY);
+            }
+        }
+        ggml_backend_tensor_set(n->in_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     }
     if (new_key) {
-        fprintf(stderr, "[NAR] Graph: %d nodes, T_lat=%d, variations=%d, prefix=%d, set=%d\n", ggml_graph_n_nodes(gf),
-                T_lat, M, ar_len, kv_set);
+        fprintf(stderr, "[NAR] Graph: %d nodes, T_lat=%d, variations=%d, prefix=%d, set=%d, key pad %d\n",
+                ggml_graph_n_nodes(gf), T_lat, M, ar_len, kv_set, kv_pad);
     }
     return true;
 }
@@ -466,6 +535,7 @@ static bool nar_velocity(Yue2NAR *            n,
     ggml_backend_sched_reset(n->sched);
     if (!ggml_backend_sched_alloc_graph(n->sched, n->graph)) {
         fprintf(stderr, "[NAR] FATAL: graph alloc failed for T_lat=%d\n", T_lat);
+        nar_out_of_memory(n, T_lat, M);
         return false;
     }
 
@@ -511,11 +581,27 @@ static void nar_dump_named(const Yue2NAR * n, const DebugDumper * dbg) {
     }
 }
 
-// Midpoint flow matching solver, t walking from 1 down to 0.
+// Flow matching solvers, t walking from 1 down to 0.
 // state [M, T_lat, latent_dim] holds the noise of every variation on entry
 // and the latents on exit. The dumper, when enabled, records the first
 // variation: the noise, the probes of the first evaluation, both velocities
 // and the state of every step, and the latents.
+//
+// HERESY 1004: four solvers on the same uniform grid dt = 1/steps.
+//
+//   midpoint   v1 at t, v2 at t - dt/2 from a half Euler step, x -= v2·dt
+//              the release; 2 network calls a step, second order
+//   euler      x -= v1·dt;  1 call, first order
+//   heun       v2 at t - dt from a full Euler step, x -= (v1 + v2)/2 · dt
+//              2 calls, second order. On the LAST step t - dt is 0, where the
+//              network was never trained (training draws t strictly inside
+//              0..1); there it takes a plain Euler step, as EDM does at σ = 0.
+//   multistep  Adams-Bashforth 2: x -= (1.5·v_n − 0.5·v_{n−1}) · dt
+//              1 call, second order, reusing the previous velocity: the idea
+//              behind DPM++ 2M. The first step has no history and is Euler.
+//
+// The chunks of a song each solve their own ODE from t = 1, so the history of
+// the multistep solver lives inside one call and never crosses a chunk.
 static bool nar_solve(Yue2NAR *            n,
                       const Qw3lmKvCache * kv,
                       float *              state,
@@ -526,14 +612,17 @@ static bool nar_solve(Yue2NAR *            n,
                       int                  steps,
                       const DebugDumper *  dbg,
                       bool (*cancelled)(void *) = nullptr,
-                      void * cancel_data        = nullptr) {
+                      void * cancel_data        = nullptr,
+                      const std::string & solver = "midpoint") {
     size_t             count = (size_t) n->latent_dim * T_lat * M;
     std::vector<float> first(count), mid(count), second(count);
     float              dt = 1.0f / (float) steps;
     char               name[64];
+    const bool         euler = solver == "euler", heun = solver == "heun", multi = solver == "multistep";
 
     debug_dump_2d(dbg, "noise", state, T_lat, n->latent_dim);
     Timer solve_timer;
+    int   calls = 0;
     for (int step = 0; step < steps; step++) {
         Timer step_timer;
         if (cancelled && cancelled(cancel_data)) {
@@ -544,18 +633,48 @@ static bool nar_solve(Yue2NAR *            n,
         if (!nar_velocity(n, kv, state, T_lat, M, ar_len, kv_set, nar_logit_clamped(t), first.data())) {
             return false;
         }
+        calls++;
         if (dbg->enabled && step == 0) {
             nar_dump_named(n, dbg);
         }
-        for (size_t i = 0; i < count; i++) {
-            mid[i] = state[i] - first[i] * (dt * 0.5f);
-        }
-        if (!nar_velocity(n, kv, mid.data(), T_lat, M, ar_len, kv_set, nar_logit_clamped(t - dt * 0.5f),
-                          second.data())) {
-            return false;
-        }
-        for (size_t i = 0; i < count; i++) {
-            state[i] -= second[i] * dt;
+        const bool last = step == steps - 1;
+        if (euler || (heun && last) || (multi && step == 0)) {
+            for (size_t i = 0; i < count; i++) {
+                state[i] -= first[i] * dt;
+            }
+            if (multi) {
+                second = first;  // the history for the next step
+            }
+        } else if (multi) {
+            // second holds v_{n-1}
+            for (size_t i = 0; i < count; i++) {
+                float v   = 1.5f * first[i] - 0.5f * second[i];
+                second[i] = first[i];
+                state[i] -= v * dt;
+            }
+        } else if (heun) {
+            for (size_t i = 0; i < count; i++) {
+                mid[i] = state[i] - first[i] * dt;
+            }
+            if (!nar_velocity(n, kv, mid.data(), T_lat, M, ar_len, kv_set, nar_logit_clamped(t - dt), second.data())) {
+                return false;
+            }
+            calls++;
+            for (size_t i = 0; i < count; i++) {
+                state[i] -= 0.5f * (first[i] + second[i]) * dt;
+            }
+        } else {
+            for (size_t i = 0; i < count; i++) {
+                mid[i] = state[i] - first[i] * (dt * 0.5f);
+            }
+            if (!nar_velocity(n, kv, mid.data(), T_lat, M, ar_len, kv_set, nar_logit_clamped(t - dt * 0.5f),
+                              second.data())) {
+                return false;
+            }
+            calls++;
+            for (size_t i = 0; i < count; i++) {
+                state[i] -= second[i] * dt;
+            }
         }
         snprintf(name, sizeof(name), "nar_step%d_first", step);
         debug_dump_2d(dbg, name, first.data(), T_lat, n->latent_dim);
@@ -567,8 +686,8 @@ static bool nar_solve(Yue2NAR *            n,
     }
     debug_dump_2d(dbg, "nar_x0", state, T_lat, n->latent_dim);
 
-    fprintf(stderr, "[NAR] Solved: T_lat=%d, %d variations, %d steps, %.0f ms (%.1f ms/step)\n", T_lat, M, steps,
-            solve_timer.ms(), solve_timer.ms() / steps);
+    fprintf(stderr, "[NAR] Solved: T_lat=%d, %d variations, %d steps (%s, %d network calls), %.0f ms (%.1f ms/step)\n",
+            T_lat, M, steps, solver.c_str(), calls, solve_timer.ms(), solve_timer.ms() / steps);
     return true;
 }
 

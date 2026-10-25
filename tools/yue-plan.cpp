@@ -36,7 +36,8 @@ static void print_usage(const char * prog) {
             "  --max-seq <N>          KV cache size (default: model context)\n"
             "  --dump-tokens <path>   Dump prefix token IDs (CSV)\n"
             "  --no-fa                Disable flash attention\n"
-            "  --clamp-fp16           Clamp hidden states to FP16 range\n",
+            "  --clamp-fp16           Clamp hidden states to FP16 range\n"
+            "  --fp16-matmul          BF16 prefills on FP16 tensor cores (RTX 20, Volta)\n",
             prog);
 }
 
@@ -92,6 +93,8 @@ int main(int argc, char ** argv) {
             no_fa = true;
         } else if (!strcmp(argv[i], "--clamp-fp16")) {
             clamp_fp16 = true;
+        } else if (!strcmp(argv[i], "--fp16-matmul")) {  // Local addition: see g_qwen3_fp16_matmul
+            g_qwen3_fp16_matmul = true;
         } else {
             print_usage(argv[0]);
             return 1;

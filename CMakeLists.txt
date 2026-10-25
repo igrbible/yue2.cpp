@@ -79,6 +79,7 @@ macro(link_ggml_backends target)
                               -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion)
     endif()
     target_link_libraries(${target} PRIVATE ggml Threads::Threads)
+    target_link_libraries(${target} PRIVATE yyjson)  # Local addition: lora.h reads LoRA headers
     if(TARGET ggml-base)
         target_link_libraries(${target} PRIVATE ggml-base)
     endif()
@@ -130,21 +131,11 @@ add_executable(yue-synth tools/yue-synth.cpp src/request.cpp src/model-store.cpp
 target_link_libraries(yue-synth PRIVATE yyjson)
 link_ggml_backends(yue-synth)
 
-# webui: convert tools/public/index.html.gz to a C header for embedding.
-# the .gz is committed to git so the C++ build works without npm.
-# to update: cd tools/webui && npm install && npm run build, then rebuild yue-server.
-set(WEBUI_INPUT "${CMAKE_CURRENT_SOURCE_DIR}/tools/public/index.html.gz")
-set(WEBUI_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/index.html.gz.hpp")
-add_custom_command(
-    OUTPUT "${WEBUI_OUTPUT}"
-    COMMAND "${CMAKE_COMMAND}" "-DINPUT=${WEBUI_INPUT}" "-DOUTPUT=${WEBUI_OUTPUT}" -P "${CMAKE_CURRENT_SOURCE_DIR}/tools/xxd.cmake"
-    DEPENDS "${WEBUI_INPUT}"
-    COMMENT "Embedding webui into index.html.gz.hpp"
-)
-set_source_files_properties(${WEBUI_OUTPUT} PROPERTIES GENERATED TRUE)
+# HERESY 1166: no page inside the server and nothing gzipped (a studio of one machine and its network): yue-server
+# reads the page build.sh makes, tools/public/index.html, from disk at every load.
 
-# yue-server: HTTP server (single slot job queue + embedded webui)
-add_executable(yue-server tools/yue-server.cpp src/request.cpp src/model-store.cpp ${WEBUI_OUTPUT})
+# yue-server: HTTP server (single slot job queue; the page from disk)
+add_executable(yue-server tools/yue-server.cpp src/request.cpp src/model-store.cpp)
 target_include_directories(yue-server PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(yue-server PRIVATE yyjson httplib)
 link_ggml_backends(yue-server)

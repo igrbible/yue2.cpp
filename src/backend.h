@@ -131,7 +131,23 @@ static BackendPair backend_init(const char * label) {
     }
 
     BackendPair bp = {};
-    bp.backend     = g_backend_device ? ggml_backend_init_by_name(g_backend_device, nullptr) : ggml_backend_init_best();
+    // HERESY 1613: GGML_BACKEND (CUDAn, CPU...) names the device as it did before upstream's --device (83b65f5), when no --device was
+    // given: start.sh, the lab's extra engines and gpu_roles.py name the card by it, and without it each landed on the best device,
+    // the studio's own card. A name that matches no device stops here, as it always did
+    const char * device = g_backend_device;
+    const char * forced = std::getenv("GGML_BACKEND");
+    if (!device && forced && *forced) {
+        if (!ggml_backend_dev_by_name(forced)) {
+            fprintf(stderr, "[Load] FATAL: GGML_BACKEND=%s not found. Available:", forced);
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                fprintf(stderr, " %s", ggml_backend_dev_name(ggml_backend_dev_get(i)));
+            }
+            fprintf(stderr, "\n");
+            exit(1);
+        }
+        device = forced;
+    }
+    bp.backend = device ? ggml_backend_init_by_name(device, nullptr) : ggml_backend_init_best();
     if (!bp.backend) {
         fprintf(stderr, "[Load] FATAL: no backend available\n");
         exit(1);

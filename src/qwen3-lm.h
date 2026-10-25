@@ -5,6 +5,8 @@
 // The AR half of the MoT backbone: the nar_* weight set is read by nar.h
 #pragma once
 
+#include "sliders.h"
+#include "lora-rt.h"  // HERESY 1447
 #include "adapter.h"
 #include "graph-arena.h"
 #include "qwen3-enc.h"  // Qwen3Layer, Qwen3Config, layer build helpers
@@ -34,7 +36,9 @@ struct Qwen3LMConfig {
 // KV cache set (one per CFG path: conditional + unconditional)
 #define QW3LM_MAX_KV_SETS 32  // batch N * 2 (cond + uncond CFG)
 #define QW3LM_MAX_LAYERS  64
-#define QW3LM_GRAPH_NODES 16384
+// Local change: room for up to 16 stacked sliders, about 6000 nodes each
+// (112 projections x ~50 ops and weights), on top of the 16384 of the backbone
+#define QW3LM_GRAPH_NODES (16384 + 16 * 6144)
 
 // Static batched decode graph. Built once per shape class and replayed with a
 // fresh input upload per step: n_kv_pad advances every 256 steps, N and the
@@ -48,6 +52,8 @@ struct Qw3lmGraphCache {
     int                   key_rows     = 0;
     struct ggml_tensor *  key_kv       = nullptr;  // the cache the graph reads, reallocated on growth
     int                   key_s0       = 0;
+    const SliderSet *     key_sliders  = nullptr;  // local addition: the sliders baked into the graph
+    const LoraRtSet *     key_lora_rt  = nullptr;  // HERESY 1447: the LoRAs that run with the graph, baked into it
     struct ggml_cgraph *  gf           = nullptr;
     struct ggml_tensor *  token_ids_t  = nullptr;
     struct ggml_tensor *  positions    = nullptr;
@@ -101,6 +107,13 @@ struct Qwen3LM {
 
     // Static batched decode graph, replayed across the token loop.
     Qw3lmGraphCache batch_graph;
+
+    // Local addition: voice/genre sliders on the attention projections while
+    // the music tokens are written (qw3lm_set_sliders), NULL otherwise
+    const SliderSet * sliders = nullptr;
+    // HERESY 1447: the LoRAs that run with the graph (lora-rt.h: a wave or a budget), NULL otherwise
+    const LoraRtSet * lora_rt     = nullptr;
+    unsigned          lora_rt_gen = 0;  // the build of it the decode graph baked
 };
 
 // Parse config.json integers, floats, bools
@@ -199,7 +212,7 @@ static void qw3lm_init_backend(Qwen3LM * m) {
     BackendPair bp    = backend_init("LM");
     m->backend        = bp.backend;
     m->cpu_backend    = bp.cpu_backend;
-    m->sched          = backend_sched_new(bp, 8192);
+    m->sched          = backend_sched_new(bp, QW3LM_GRAPH_NODES);
     m->use_flash_attn = bp.has_gpu;
     m->clamp_fp16     = false;
 }
@@ -393,7 +406,10 @@ static struct ggml_tensor * qw3lm_build_attn(struct ggml_context * ctx,
                                              int                   n_kv_pad,
                                              int                   n_tokens,
                                              bool                  use_flash_attn = true,
-                                             bool                  clamp_fp16     = false) {
+                                             bool                  clamp_fp16     = false,
+                                             const SliderSet *     sliders        = nullptr,
+                                             int                   layer          = -1,
+                                             const LoraRtSet *     lora_rt        = nullptr) {
     int D   = c.head_dim;
     int Nh  = c.n_heads;
     int Nkv = c.n_kv_heads;
@@ -417,6 +433,16 @@ static struct ggml_tensor * qw3lm_build_attn(struct ggml_context * ctx,
         q = qwen3_linear(ctx, ly->q_proj, x);
         k = qwen3_linear(ctx, ly->k_proj, x);
         v = qwen3_linear(ctx, ly->v_proj, x);
+    }
+    if (sliders_active(sliders)) {
+        q = slider_apply(ctx, sliders, layer, SLIDER_Q, x, q);
+        k = slider_apply(ctx, sliders, layer, SLIDER_K, x, k);
+        v = slider_apply(ctx, sliders, layer, SLIDER_V, x, v);
+    }
+    if (lora_rt_active(lora_rt)) {  // HERESY 1447
+        q = lora_rt_apply(ctx, lora_rt, layer, LRT_Q, x, q);
+        k = lora_rt_apply(ctx, lora_rt, layer, LRT_K, x, k);
+        v = lora_rt_apply(ctx, lora_rt, layer, LRT_V, x, v);
     }
 
     // Reshape to heads: [X*D, S] -> [D, X, S]
@@ -476,7 +502,8 @@ static struct ggml_tensor * qw3lm_build_attn(struct ggml_context * ctx,
     attn = ggml_reshape_2d(ctx, attn, Nh * D, S);
 
     // O projection
-    return qwen3_linear(ctx, ly->o_proj, attn);
+    return lora_rt_apply(ctx, lora_rt, layer, LRT_O, attn,
+                         slider_apply(ctx, sliders, layer, SLIDER_O, attn, qwen3_linear(ctx, ly->o_proj, attn)));
 }
 
 // Rows [row0, row0 + rows) of the LM head, the vocabulary window a stage
@@ -556,7 +583,7 @@ static void qw3lm_forward(Qwen3LM *      m,
         // Self-attention with KV cache
         struct ggml_tensor * attn =
             qw3lm_build_attn(ctx, gf, c, ly, norm, positions, mask, kv_rows, kv->k[kv_set][l], kv->v[kv_set][l],
-                             n_kv_pad, n_tokens, m->use_flash_attn, m->clamp_fp16);
+                             n_kv_pad, n_tokens, m->use_flash_attn, m->clamp_fp16, m->sliders, l, m->lora_rt);
 
         // Residual
         hidden = ggml_add(ctx, hidden, attn);
@@ -566,7 +593,8 @@ static void qw3lm_forward(Qwen3LM *      m,
 
         // Post-attention norm + MLP
         norm                     = qwen3_rms_norm(ctx, hidden, ly->post_attn_layernorm, c.rms_norm_eps);
-        struct ggml_tensor * mlp = qwen3_build_mlp(ctx, ly, norm, n_tokens);
+        struct ggml_tensor * mlp = lora_rt_touches_mlp(m->lora_rt, l) ? lora_rt_build_mlp(ctx, ly, norm, m->lora_rt, l) :
+                                                                         qwen3_build_mlp(ctx, ly, norm, n_tokens);
         hidden                   = ggml_add(ctx, hidden, mlp);
         if (m->clamp_fp16) {
             hidden = ggml_clamp(ctx, hidden, -65504.0f, 65504.0f);
@@ -688,7 +716,8 @@ static void qw3lm_forward_batch(Qwen3LM *      m,
     const bool need_build = !m->batch_graph.built || m->batch_graph.key_n_kv_pad != n_kv_pad ||
                             m->batch_graph.key_N != N || m->batch_graph.key_s0 != s0 ||
                             m->batch_graph.key_row0 != row0 || m->batch_graph.key_rows != rows ||
-                            m->batch_graph.key_kv != kv->k4[0];
+                            m->batch_graph.key_kv != kv->k4[0] || m->batch_graph.key_sliders != m->sliders ||
+                            m->batch_graph.key_lora_rt != m->lora_rt;
     if (need_build) {
         static_graph_release(&m->batch_graph.graph, m->sched);
         m->batch_graph.built      = false;
@@ -746,6 +775,16 @@ static void qw3lm_forward_batch(Qwen3LM *      m,
                 q = qwen3_linear(ctx, ly->q_proj, norm);
                 k = qwen3_linear(ctx, ly->k_proj, norm);
                 v = qwen3_linear(ctx, ly->v_proj, norm);
+            }
+            if (sliders_active(m->sliders)) {
+                q = slider_apply(ctx, m->sliders, l, SLIDER_Q, norm, q);
+                k = slider_apply(ctx, m->sliders, l, SLIDER_K, norm, k);
+                v = slider_apply(ctx, m->sliders, l, SLIDER_V, norm, v);
+            }
+            if (lora_rt_active(m->lora_rt)) {  // HERESY 1447
+                q = lora_rt_apply(ctx, m->lora_rt, l, LRT_Q, norm, q);
+                k = lora_rt_apply(ctx, m->lora_rt, l, LRT_K, norm, k);
+                v = lora_rt_apply(ctx, m->lora_rt, l, LRT_V, norm, v);
             }
 
             // Reshape to heads: [D, Heads, N]
@@ -816,7 +855,9 @@ static void qw3lm_forward_batch(Qwen3LM *      m,
             struct ggml_tensor * attn_cat = ggml_reshape_2d(ctx, attn_result, Nh * D, N);
 
             // Batched O proj
-            struct ggml_tensor * attn_out = qwen3_linear(ctx, ly->o_proj, attn_cat);
+            struct ggml_tensor * attn_out = lora_rt_apply(
+                ctx, m->lora_rt, l, LRT_O, attn_cat,
+                slider_apply(ctx, m->sliders, l, SLIDER_O, attn_cat, qwen3_linear(ctx, ly->o_proj, attn_cat)));
             hidden                        = ggml_add(ctx, hidden, attn_out);
             if (m->clamp_fp16) {
                 hidden = ggml_clamp(ctx, hidden, -65504.0f, 65504.0f);
@@ -824,7 +865,8 @@ static void qw3lm_forward_batch(Qwen3LM *      m,
 
             // Batched FFN
             norm                     = qwen3_rms_norm(ctx, hidden, ly->post_attn_layernorm, c.rms_norm_eps);
-            struct ggml_tensor * mlp = qwen3_build_mlp(ctx, ly, norm, N);
+            struct ggml_tensor * mlp = lora_rt_touches_mlp(m->lora_rt, l) ? lora_rt_build_mlp(ctx, ly, norm, m->lora_rt, l) :
+                                                                             qwen3_build_mlp(ctx, ly, norm, N);
             hidden                   = ggml_add(ctx, hidden, mlp);
             if (m->clamp_fp16) {
                 hidden = ggml_clamp(ctx, hidden, -65504.0f, 65504.0f);
@@ -855,6 +897,8 @@ static void qw3lm_forward_batch(Qwen3LM *      m,
         m->batch_graph.key_row0     = row0;
         m->batch_graph.key_rows     = rows;
         m->batch_graph.key_kv       = kv->k4[0];
+        m->batch_graph.key_sliders  = m->sliders;
+        m->batch_graph.key_lora_rt  = m->lora_rt;
         m->batch_graph.pos_data.resize((size_t) N);
         m->batch_graph.rows_data.resize((size_t) N);
         m->batch_graph.mask_data.resize((size_t) n_kv_pad * (size_t) N);
@@ -903,6 +947,35 @@ static void qw3lm_forward_batch(Qwen3LM *      m,
 }
 
 // Free all resources
+// Local addition: attach (or with NULL, detach) the sliders. The static decode
+// graph bakes them in, so a change drops it and the next step rebuilds.
+static void qw3lm_set_sliders(Qwen3LM * m, const SliderSet * sliders) {
+    const SliderSet * next = sliders_active(sliders) ? sliders : nullptr;
+    if (m->sliders == next) {
+        return;
+    }
+    if (m->batch_graph.graph.sched_allocated) {
+        static_graph_release(&m->batch_graph.graph, m->sched);
+    }
+    m->batch_graph.built = false;
+    m->sliders           = next;
+}
+
+// HERESY 1447: attach (or with NULL, detach) the LoRAs that run with the graph; the static decode graph bakes them in,
+// as it does the sliders, so a change drops it
+static void qw3lm_set_lora_rt(Qwen3LM * m, const LoraRtSet * set) {
+    const LoraRtSet * next = lora_rt_active(set) ? set : nullptr;
+    if (m->lora_rt == next && (!next || m->lora_rt_gen == next->gen)) {  // the same build: the graph holds
+        return;
+    }
+    if (m->batch_graph.graph.sched_allocated) {
+        static_graph_release(&m->batch_graph.graph, m->sched);
+    }
+    m->batch_graph.built = false;
+    m->lora_rt           = next;
+    m->lora_rt_gen       = next ? next->gen : 0;
+}
+
 static void qw3lm_free(Qwen3LM * m) {
     static_graph_release(&m->batch_graph.graph, m->sched);
     graph_arena_free(&m->arena_batch);

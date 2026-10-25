@@ -586,7 +586,7 @@ the server rejects a request with neither.
     "cfg_scale":       -1.0,
     "semantic_tokens": "",
     "peak_clip":       10,
-    "output_format":   "mp3",
+    "output_format":   "wav24",
     "mp3_bitrate":     128,
     "source_tokens":   "",
     "source_start":    0.0,
@@ -667,7 +667,7 @@ Output normalization percentile control: the normalization peak is the
 `1 - peak_clip / 1e6` percentile of the absolute signal. `0` normalizes to
 the true peak with no clipping. Ignored by `wav32`.
 
-**`output_format`** (string, default `"mp3"`)
+**`output_format`** (string, default `"wav24"`; HERESY 1413)
 Audio encoder: `"mp3"`, `"wav16"`, `"wav24"`, `"wav32"`.
 
 **`mp3_bitrate`** (int, default `128`)
@@ -734,7 +734,7 @@ Required:
 Optional:
   --device <name>        Compute device: CUDA0, Vulkan0, MTL0, CPU...
                          (default: best available)
-  --out <path>           Output audio (default: song.mp3), a batch numbers it
+  --out <path>           Output audio (default: song.wav, 24-bit), a batch numbers it
   --duration <s>         Target length in seconds
   --lm-seed <N>          Token sampling seed
   --seed <N>             Acoustic noise seed

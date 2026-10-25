@@ -64,7 +64,17 @@ static struct ggml_tensor * qwen3_f32(struct ggml_context * ctx, struct ggml_ten
     return ggml_cast(ctx, t, GGML_TYPE_F32);
 }
 
+// Local addition: --fp16-matmul. A GPU without BF16 tensor cores (NVIDIA before
+// Ampere: RTX 20, Volta) runs a batched BF16 matmul on its FP32 cores. With this
+// set, a matmul of more than 8 rows (a prefill, every sound-stage evaluation)
+// casts its BF16 weight to F16 first, which sends it to the FP16 tensor cores.
+// Single-token decode keeps reading BF16. start.sh turns it on for compute 7.x.
+inline bool g_qwen3_fp16_matmul = false;
+
 static struct ggml_tensor * qwen3_linear(struct ggml_context * ctx, struct ggml_tensor * w, struct ggml_tensor * x) {
+    if (g_qwen3_fp16_matmul && w->type == GGML_TYPE_BF16 && ggml_nrows(x) > 8) {
+        w = ggml_cast(ctx, w, GGML_TYPE_F16);
+    }
     return ggml_mul_mat(ctx, w, x);
 }
 

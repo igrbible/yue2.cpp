@@ -397,6 +397,10 @@ def main():
     converted = 0
     for comp in COMPONENTS:
         output_path = os.path.join(OUTPUT_DIR, "%s-%s.gguf" % (COMPONENTS[comp], native[comp]))
+        # HERESY 1610: the audio tokenizer only serves /tokenize; an install without its checkpoint converts the rest, and says so
+        if comp == "tokenizer" and not os.path.isdir(os.path.join(CHECKPOINT_DIR, COMPONENTS[comp])):
+            log("GGUF", "skip tokenizer: no checkpoints/%s (only /tokenize reads it)" % COMPONENTS[comp])
+            continue
         if os.path.exists(output_path):
             log("GGUF", "skip %s: %s exists" % (comp, os.path.basename(output_path)))
             converted += 1

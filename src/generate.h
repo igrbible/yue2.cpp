@@ -12,6 +12,7 @@
 // holds for the whole loop.
 #pragma once
 
+#include "harmony.h"   // HERESY 1606
 #include "qwen3-lm.h"
 #include "sampling.h"
 #include "timer.h"
@@ -61,30 +62,50 @@ static bool yue2_generate(Qwen3LM *                             lm,
                           const std::vector<std::vector<int>> & prefixes,
                           const std::vector<std::vector<int>> & negatives,
                           float                                 cfg_scale,
-                          const Yue2Sampling &                  s,
+                          const Yue2Sampling &                  s_in,
                           int64_t                               seed,
                           Yue2Phase                             phase,
                           std::vector<Yue2Generation> *         out,
                           bool (*cancelled)(void *) = nullptr,
-                          void * cancel_data        = nullptr) {
+                          void * cancel_data        = nullptr,
+                          const std::vector<std::vector<int>> * lyricless = nullptr,
+                          float                                 lyrics_scale = -1.0f,
+                          const Yue2HarmonyPlan *               harmony      = nullptr) {   // HERESY 1606
     const int B       = (int) prefixes.size();
     const int context = kv->cfg.max_seq_len;
-    bool      guided  = cfg_scale != 1.0f;
+    // HERESY 1397: the lyrics' own scale: a third branch, the prompt without its lyrics, in KV sets 2B..3B-1
+    const bool split  = lyricless && (int) lyricless->size() == B && lyrics_scale >= 0.0f && lyrics_scale != cfg_scale;
+    bool      guided  = cfg_scale != 1.0f || split;
     if (guided && (int) negatives.size() != B) {
         fprintf(stderr, "[AR] FATAL: guidance %.3f needs an unconditional prefix per sequence\n", (double) cfg_scale);
         return false;
     }
-    // Every set holds its prefix, the budget and the end token
+    // Every set holds its prefix, the budget and the end token.
+    // HERESY 1032: a budget that does not fit beside the prefix is cut to what does, instead of a
+    // FATAL: a long speech asks for 15 minutes and gets what the context holds (a song that runs
+    // into the cut is marked truncated, as at any budget). Only a prefix with no room left fails.
+    Yue2Sampling s = s_in;
     for (int i = 0; i < B; i++) {
         size_t longest = guided && negatives[i].size() > prefixes[i].size() ? negatives[i].size() : prefixes[i].size();
-        if ((int) longest + s.max_tokens + 1 > context) {
-            fprintf(stderr, "[AR] FATAL: prefix %zu + budget %d + end exceeds context %d\n", longest, s.max_tokens,
-                    context);
+        if (split && (*lyricless)[i].size() > longest) {
+            longest = (*lyricless)[i].size();
+        }
+        int    room    = context - (int) longest - 1;
+        if (room < 1) {
+            fprintf(stderr, "[AR] FATAL: prefix %zu leaves no room in context %d\n", longest, context);
             return false;
+        }
+        if (s.max_tokens > room) {
+            fprintf(stderr, "[AR] Budget %d cut to %d: prefix %zu + end fill the rest of context %d\n", s.max_tokens, room,
+                    longest, context);
+            s.max_tokens = room;
+            if (s.min_tokens > s.max_tokens) {
+                s.min_tokens = s.max_tokens;
+            }
         }
     }
 
-    const int N = guided ? 2 * B : B;
+    const int N = split ? 3 * B : guided ? 2 * B : B;
     if (!qw3lm_kv_sets(kv, N)) {
         return false;
     }
@@ -104,6 +125,10 @@ static bool yue2_generate(Qwen3LM *                             lm,
         kv_sets[i] = i;
     }
 
+    if (phase == YUE2_PHASE_SEMANTIC) {
+        sliders_progress(lm->sliders, 0, s.max_tokens);   // HERESY 1166: the curves at the start of the music
+        lora_rt_progress(lm->lora_rt, 0, s.max_tokens);   // HERESY 1447: and the LoRAs' waves
+    }
     Timer prefill_timer;
     for (int i = 0; i < B; i++) {
         yue2_prefill(lm, kv, prefixes, 0, i, batched.data(), row0, rows, label);
@@ -113,8 +138,14 @@ static bool yue2_generate(Qwen3LM *                             lm,
             yue2_prefill(lm, kv, negatives, B, i, batched.data(), row0, rows, "Unconditional");
         }
     }
-    fprintf(stderr, "[AR] %s prefill: %.0f ms, CFG=%.2f, top_k=%d, budget=%d, songs=%d, batch=%d\n", label,
-            prefill_timer.ms(), (double) cfg_scale, s.top_k, s.max_tokens, B, N);
+    if (split) {
+        for (int i = 0; i < B; i++) {
+            yue2_prefill(lm, kv, *lyricless, 2 * B, i, batched.data(), row0, rows, "Without lyrics");
+        }
+    }
+    fprintf(stderr, "[AR] %s prefill: %.0f ms, CFG=%.2f%s, top_k=%d, budget=%d, songs=%d, batch=%d\n", label,
+            prefill_timer.ms(), (double) cfg_scale, split ? (", lyrics " + std::to_string(lyrics_scale).substr(0, 4)).c_str() : "",
+            s.top_k, s.max_tokens, B, N);
 
     out->assign((size_t) B, { {}, true });
 
@@ -125,6 +156,10 @@ static bool yue2_generate(Qwen3LM *                             lm,
     std::vector<int>           tokens(N);
     std::vector<float>         mixed(guided ? (size_t) rows : 0);
     std::vector<Yue2Candidate> candidates;
+    // HERESY 1606: chord variety and section order of the plan, off unless asked for (timoncool/yue2.cpp 1e21e63)
+    const bool                    steered = harmony && phase == YUE2_PHASE_ABC && harmony->cfg.active();
+    std::vector<Yue2HarmonyState> chords(steered ? (size_t) B : 0);
+    std::vector<float>            steered_logits;
     int                        step = 0;
     for (;; step++) {
         if (cancelled && cancelled(cancel_data)) {
@@ -137,12 +172,25 @@ static bool yue2_generate(Qwen3LM *                             lm,
             if (owed[i] < 0) {
                 const float * cond   = batched.data() + (size_t) i * rows;
                 const float * logits = cond;
-                if (guided) {
+                if (split) {                     // HERESY 1397: the style's pull and the lyrics' pull, each at its own scale
+                    const float * uncond = batched.data() + (size_t) (B + i) * rows;
+                    const float * styled = batched.data() + (size_t) (2 * B + i) * rows;
+                    for (int k = 0; k < rows; k++) {
+                        mixed[k] = uncond[k] + cfg_scale * (styled[k] - uncond[k]) + lyrics_scale * (cond[k] - styled[k]);
+                    }
+                    logits = mixed.data();
+                } else if (guided) {
                     const float * uncond = batched.data() + (size_t) (B + i) * rows;
                     for (int k = 0; k < rows; k++) {
                         mixed[k] = uncond[k] + cfg_scale * (cond[k] - uncond[k]);
                     }
                     logits = mixed.data();
+                }
+                if (steered) {   // HERESY 1606: the ABC rows start at id 0, so the content ids index the logits as they are
+                    yue2_harmony_feed(*harmony, &chords[(size_t) i], g.tokens);
+                    if (yue2_harmony_apply(*harmony, &chords[(size_t) i], logits, rows, std::max(64, s.top_k), &steered_logits)) {
+                        logits = steered_logits.data();
+                    }
                 }
                 yue2_distribution(logits, s, g.tokens, step, phase, candidates);
                 int token = yue2_draw(candidates, seed + i, step);
@@ -163,6 +211,9 @@ static bool yue2_generate(Qwen3LM *                             lm,
             if (guided) {
                 tokens[B + i] = tokens[i];
             }
+            if (split) {
+                tokens[2 * B + i] = tokens[i];
+            }
             pending = pending || owed[i] != 0;
         }
         if (!pending) {
@@ -170,6 +221,10 @@ static bool yue2_generate(Qwen3LM *                             lm,
         }
         if ((step % 100) == 0) {
             fprintf(stderr, "[AR] %s %d/%d\n", label, step, s.max_tokens);
+        }
+        if (phase == YUE2_PHASE_SEMANTIC) {
+            sliders_progress(lm->sliders, step + 1, s.max_tokens);   // HERESY 1166: each slider where its curve is now
+            lora_rt_progress(lm->lora_rt, step + 1, s.max_tokens);   // HERESY 1447: each LoRA where its wave is now
         }
         qw3lm_forward_batch(lm, kv, tokens.data(), kv_sets.data(), N, batched.data(), row0, rows);
         for (int i = 0; i < B; i++) {

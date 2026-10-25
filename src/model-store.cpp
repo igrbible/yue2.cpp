@@ -39,6 +39,7 @@ struct ModelKeyHash {
     size_t operator()(const ModelKey & k) const noexcept {
         size_t h = std::hash<int>{}(static_cast<int>(k.kind));
         h ^= std::hash<std::string>{}(k.path) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::hash<std::string>{}(k.lora_sig) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
         for (const AdapterUse & a : k.adapters) {
             h ^= std::hash<std::string>{}(a.path) + std::hash<float>{}(a.scale) + 0x9e3779b97f4a7c15ULL + (h << 6) +
                  (h >> 2);
@@ -49,7 +50,7 @@ struct ModelKeyHash {
 
 struct ModelKeyEq {
     bool operator()(const ModelKey & a, const ModelKey & b) const noexcept {
-        return a.kind == b.kind && a.path == b.path && a.adapters == b.adapters;
+        return a.kind == b.kind && a.path == b.path && a.lora_sig == b.lora_sig && a.adapters == b.adapters;
     }
 };
 
@@ -230,6 +231,41 @@ static size_t bytes_of_ss2(const SheetSage2 * m) {
     return m && m->wctx.buffer ? ggml_backend_buffer_get_size(m->wctx.buffer) : 0;
 }
 
+// Local addition: with models kept loaded, a half loaded with other LoRAs (or
+// another file) is swapped out when idle rather than kept beside the new one.
+static void evict_same_kind_idle(ModelStore * s, const ModelKey & keep) {
+    ModelKeyEq eq;
+    for (auto it = s->gpu.begin(); it != s->gpu.end();) {
+        if (it->first.kind == keep.kind && !eq(it->first, keep) && it->second.refcount == 0) {
+            fprintf(stderr, "[Store] Swap out %s (%.1f MB)\n", it->second.label, (float) it->second.bytes / (1024.0f * 1024.0f));
+            s->handle_to_key.erase(it->second.ptr);
+            it->second.deleter(it->second.ptr);
+            it = s->gpu.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// Local addition: load with the key's LoRAs merged; a failed merge discards the load
+template <typename T> static bool load_with_loras(const ModelKey & k, T * m, bool (*load)(T *, const char *, const std::vector<AdapterUse> &),
+                                                   void (*unload)(T *)) {
+    g_gf_lora = k.lora.get();
+    g_gf_lora_error.clear();
+    Timer t;
+    bool  ok = load(m, k.path.c_str(), k.adapters);   // upstream's adapters merge in the same load (1603)
+    g_gf_lora = nullptr;
+    if (ok && !g_gf_lora_error.empty()) {
+        fprintf(stderr, "[LoRA] FATAL: %s\n", g_gf_lora_error.c_str());
+        unload(m);
+        return false;
+    }
+    if (ok && k.lora) {
+        fprintf(stderr, "[LoRA] Merged while loading (%.0f ms in all)\n", t.ms());
+    }
+    return ok;
+}
+
 static size_t bytes_of_atok(const AudioTokenizer * m) {
     return m && m->wctx.buffer ? ggml_backend_buffer_get_size(m->wctx.buffer) : 0;
 }
@@ -240,10 +276,12 @@ Qwen3LM * store_require_lm(ModelStore * s, const ModelKey & k) {
     }
     if (s->policy == EVICT_STRICT) {
         evict_conflicts(s, k);
+    } else {
+        evict_same_kind_idle(s, k);
     }
     Timer     t;
     Qwen3LM * m = new Qwen3LM();
-    if (!qw3lm_load(m, k.path.c_str(), k.adapters)) {
+    if (!load_with_loras<Qwen3LM>(k, m, qw3lm_load, qw3lm_free)) {
         delete m;
         return nullptr;
     }
@@ -258,10 +296,12 @@ Yue2NAR * store_require_nar(ModelStore * s, const ModelKey & k) {
     }
     if (s->policy == EVICT_STRICT) {
         evict_conflicts(s, k);
+    } else {
+        evict_same_kind_idle(s, k);
     }
     Timer     t;
     Yue2NAR * m = new Yue2NAR();
-    if (!nar_load(m, k.path.c_str(), k.adapters)) {
+    if (!load_with_loras<Yue2NAR>(k, m, nar_load, nar_free)) {
         delete m;
         return nullptr;
     }
@@ -276,6 +316,10 @@ VAEGGML * store_require_vae(ModelStore * s, const ModelKey & k) {
     }
     if (s->policy == EVICT_STRICT) {
         evict_conflicts(s, k);
+    } else {
+        // Local addition (HERESY 1169): one decoder on the card at a time, as the LM and the NAR above. Each keeps its
+        // working buffer (3.1 GB for 1024-frame tiles), and a third one decoding beside two idle ones ran out of memory
+        evict_same_kind_idle(s, k);
     }
     Timer     t;
     VAEGGML * m = new VAEGGML();
@@ -380,6 +424,34 @@ BPETokenizer * store_bpe(ModelStore * s, const char * lm_path) {
     };
     s->bpe_by_path.emplace(key, e);
     return bpe;
+}
+
+void store_set_policy(ModelStore * s, EvictPolicy policy) {
+    if (s->policy == policy) {
+        return;
+    }
+    s->policy = policy;
+    fprintf(stderr, "[Store] Policy now %s\n", policy == EVICT_STRICT ? "STRICT" : "NEVER");
+    if (policy == EVICT_STRICT) {
+        store_unload_idle(s);
+    }
+}
+
+size_t store_unload_idle(ModelStore * s) {
+    size_t freed = 0;
+    for (auto it = s->gpu.begin(); it != s->gpu.end();) {
+        GpuEntry & e = it->second;
+        if (e.refcount > 0) {
+            ++it;
+            continue;
+        }
+        fprintf(stderr, "[Store] Unload %s (%.1f MB)\n", e.label, (float) e.bytes / (1024.0f * 1024.0f));
+        freed += e.bytes;
+        s->handle_to_key.erase(e.ptr);
+        e.deleter(e.ptr);
+        it = s->gpu.erase(it);
+    }
+    return freed;
 }
 
 size_t store_vram_bytes(const ModelStore * s) {

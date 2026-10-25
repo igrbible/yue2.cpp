@@ -44,7 +44,7 @@ static void print_usage(const char * prog) {
             "Optional:\n"
             "  --device <name>        Compute device: CUDA0, Vulkan0, MTL0, CPU...\n"
             "                         (default: best available)\n"
-            "  --out <path>           Output audio (default: song.mp3), a batch numbers it\n"
+            "  --out <path>           Output audio (default: song.wav, 24-bit), a batch numbers it\n"
             "  --duration <s>         Target length in seconds\n"
             "  --lm-seed <N>          Token sampling seed\n"
             "  --seed <N>             Acoustic noise seed\n"
@@ -59,7 +59,9 @@ static void print_usage(const char * prog) {
             "  --vae-core <N>         VAE tile core frames (default: 512)\n"
             "  --vae-halo <N>         VAE tile halo frames (default: 16)\n"
             "  --no-fa                Disable flash attention\n"
+            "  --no-fa-lm             Disable flash attention in the music half (AR) only\n"
             "  --clamp-fp16           Clamp hidden states to FP16 range\n"
+            "  --fp16-matmul          BF16 prefills and flow matching on FP16 tensor cores (RTX 20, Volta)\n"
             "  --dump <dir>           Dump intermediate tensors\n",
             prog);
 }
@@ -121,10 +123,14 @@ int main(int argc, char ** argv) {
             params.vae_core = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--vae-halo") && !last) {
             params.vae_halo = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--no-fa-lm")) {   // HERESY 1008
+            params.no_fa_lm = true;
         } else if (!strcmp(argv[i], "--no-fa")) {
             params.no_fa = true;
         } else if (!strcmp(argv[i], "--clamp-fp16")) {
             params.clamp_fp16 = true;
+        } else if (!strcmp(argv[i], "--fp16-matmul")) {  // Local addition
+            params.fp16_matmul = true;
         } else if (!strcmp(argv[i], "--dump") && !last) {
             params.dump_dir = argv[++i];
         } else {

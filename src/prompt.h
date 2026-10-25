@@ -131,7 +131,11 @@ static std::vector<int> yue2_build_negative_ids(Tokenize bpe_encode, Yue2Cot cot
     return ids;
 }
 
-// Guidance the protocol applies when the request leaves cfg_scale unset
+// Guidance the protocol applies when the request leaves cfg_scale unset.
+// HERESY 1031: 1.6 in every mode, Viktor's stable set (01.10.2026). The release had 1.01 in off
+// mode and 1.0 (a single branch) otherwise; 1.6 keeps a second, unconditioned branch: half
+// the speed of the music stage and 2.8 GB more cache a version at the full context.
 static float yue2_default_guidance(Yue2Cot cot) {
-    return cot == YUE2_COT_OFF ? 1.01f : 1.0f;
+    (void) cot;
+    return 1.6f;
 }

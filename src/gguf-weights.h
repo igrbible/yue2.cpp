@@ -15,7 +15,9 @@
 
 #include "gguf.h"
 #include "weight-ctx.h"
+#include "lora.h"  // Local addition
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -164,6 +166,168 @@ static bool gf_load(GGUFModel * gf, const char * path) {
     return true;
 }
 
+// Local addition: the LoRA set merged into weights as they load. The store sets
+// it around one module's load; a merge that fails leaves its reason in
+// g_gf_lora_error and the store throws that load away.
+inline LoraSet *   g_gf_lora = nullptr;
+inline std::string g_gf_lora_error;
+
+static int64_t gf_lora_rows(void * ctx, const std::string & name, int64_t * cols) {
+    const GGUFModel *    gf = static_cast<const GGUFModel *>(ctx);
+    struct ggml_tensor * t  = ggml_get_tensor(gf->meta, name.c_str());
+    if (!t) {
+        return 0;
+    }
+    if (ggml_n_dims(t) == 1) {
+        *cols = 1;
+        return t->ne[0];
+    }
+    *cols = t->ne[0];
+    return t->ne[1];
+}
+
+// The type a LoRA-merged weight is kept in: float types keep theirs; quantized
+// ones become Q8_0, because a LoRA's change is often smaller than Q6_K/Q5_K
+// rounding and would be lost by re-quantizing to them (measured: no closer to
+// the merged weights than leaving the LoRA out, on the weights it barely moves).
+static enum ggml_type gf_lora_type(enum ggml_type t) {
+    return (t == GGML_TYPE_F32 || t == GGML_TYPE_BF16 || t == GGML_TYPE_F16) ? t : GGML_TYPE_Q8_0;
+}
+
+static bool gf_lora_hits(const GGUFModel & gf, const std::vector<std::string> & names) {
+    if (!g_gf_lora) {
+        return false;
+    }
+    std::string error;
+    if (!lora_bind(g_gf_lora, gf_lora_rows, (void *) &gf, &error)) {
+        if (g_gf_lora_error.empty()) {
+            g_gf_lora_error = error;
+        }
+        return false;
+    }
+    for (const auto & n : names) {
+        if (lora_touches(g_gf_lora, n)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const void * gf_lora_stage(WeightCtx * wctx, const GGUFModel & gf, const std::string & name,
+                                  const struct ggml_tensor * src, const void * raw, enum ggml_type want, size_t * nbytes,
+                                  bool force);
+
+// One part of a fused weight converted to `type` (merged if a LoRA touches it);
+// on a failed merge a zero buffer keeps the offsets valid (the load is discarded)
+static void gf_lora_push_part(WeightCtx * wctx, const GGUFModel & gf, struct ggml_tensor * fused, const std::string & name,
+                              const struct ggml_tensor * src, const void * raw, enum ggml_type type, size_t at) {
+    size_t       bytes  = 0;
+    const void * merged = gf_lora_stage(wctx, gf, name, src, raw, type, &bytes, true);
+    if (!merged) {
+        bytes    = ggml_row_size(type, src->ne[0]) * (size_t) src->ne[1];
+        auto buf = std::make_unique<float[]>((bytes + 3) / 4);
+        merged   = buf.get();
+        wctx->staging.push_back(std::move(buf));
+    }
+    wctx->pending.push_back({ fused, merged, bytes, at });
+}
+
+// When the set touches `name`: the merged tensor in `want` (F32, or the file's own
+// type, re-quantized if need be) in a staging buffer, and its size; else NULL.
+static const void * gf_lora_stage(WeightCtx * wctx, const GGUFModel & gf, const std::string & name,
+                                  const struct ggml_tensor * src, const void * raw, enum ggml_type want, size_t * nbytes,
+                                  bool force) {
+    if (!g_gf_lora) {
+        return NULL;
+    }
+    std::string error;
+    if (!lora_bind(g_gf_lora, gf_lora_rows, (void *) &gf, &error)) {
+        if (g_gf_lora_error.empty()) {
+            g_gf_lora_error = error;
+        }
+        return NULL;
+    }
+    if (!lora_touches(g_gf_lora, name) && !force) {
+        return NULL;
+    }
+    int64_t cols = 1, rows = gf_lora_rows((void *) &gf, name, &cols);
+    size_t  n    = (size_t) (rows * cols);
+    std::vector<LoraPrepared> ps;
+    if (!lora_prepare(g_gf_lora, name, rows, cols, &ps, &error)) {
+        if (g_gf_lora_error.empty()) {
+            g_gf_lora_error = error;
+        }
+        return NULL;
+    }
+    if (want != GGML_TYPE_F32 && want != GGML_TYPE_BF16 && want != GGML_TYPE_F16 && ggml_quantize_requires_imatrix(want)) {
+        if (g_gf_lora_error.empty()) {
+            g_gf_lora_error = std::string("LoRAs cannot be merged into ") + ggml_type_name(want) +
+                              " weights (re-quantizing needs an importance matrix); use a BF16, Q8_0, Q6_K or Q5_K_M model";
+        }
+        return NULL;
+    }
+    // One pass per block of rows, on several threads: decode, add, check, encode
+    const size_t src_row = ggml_row_size(src->type, cols), out_row = ggml_row_size(want, cols);
+    auto         f32     = std::make_unique<float[]>(n);
+    size_t       bytes   = want == GGML_TYPE_F32 ? n * sizeof(float) : out_row * (size_t) rows;
+    std::unique_ptr<float[]> out;
+    if (want != GGML_TYPE_F32) {
+        out = std::make_unique<float[]>((bytes + 3) / 4);
+    }
+    bool has_replace = false;
+    for (const auto & p : ps) {
+        has_replace |= p.kind == LoraGroup::REPLACE;
+    }
+    std::vector<float> base;
+    if (has_replace) {
+        base.resize(n);
+    }
+    std::atomic<bool> finite{ true };
+    lora_parallel_rows(rows, [&](int64_t r0, int64_t r1) {
+        float *      w   = f32.get() + r0 * cols;
+        const char * in  = static_cast<const char *>(raw) + (size_t) r0 * src_row;
+        int64_t      cnt = (r1 - r0) * cols;
+        if (src->type == GGML_TYPE_F32) {
+            memcpy(w, in, (size_t) cnt * sizeof(float));
+        } else {
+            ggml_get_type_traits(src->type)->to_float(in, w, cnt);
+        }
+        if (has_replace) {
+            memcpy(base.data() + r0 * cols, w, (size_t) cnt * sizeof(float));
+        }
+        lora_apply_rows(ps, f32.get(), base.data(), r0, r1, cols);
+        for (int64_t i = 0; i < cnt; i++) {
+            if (!std::isfinite(w[i])) {
+                finite = false;
+                break;
+            }
+        }
+        if (want == GGML_TYPE_BF16) {
+            ggml_fp32_to_bf16_row(w, reinterpret_cast<ggml_bf16_t *>(out.get()) + r0 * cols, cnt);
+        } else if (want == GGML_TYPE_F16) {
+            ggml_fp32_to_fp16_row(w, reinterpret_cast<ggml_fp16_t *>(out.get()) + r0 * cols, cnt);
+        } else if (want != GGML_TYPE_F32) {
+            ggml_quantize_chunk(want, f32.get(), out.get(), r0 * cols, r1 - r0, cols, nullptr);
+        }
+    });
+    if (!finite) {
+        if (g_gf_lora_error.empty()) {
+            g_gf_lora_error = "the merge made " + name + " non-finite; lower the strength";
+        }
+        return NULL;
+    }
+    if (want == GGML_TYPE_F32) {
+        *nbytes             = bytes;
+        const void * merged = f32.get();
+        wctx->staging.push_back(std::move(f32));
+        return merged;
+    }
+    *nbytes             = bytes;
+    const void * merged = out.get();
+    wctx->staging.push_back(std::move(out));
+    return merged;
+}
+
 // Load a tensor from GGUF into the weight context.
 // Returns ggml_tensor (not yet backed by memory; call wctx_alloc after all loads).
 // Tensor shapes are already in ggml order (ne[0]=innermost).
@@ -184,7 +348,6 @@ static struct ggml_tensor * gf_load_tensor(WeightCtx *         wctx,
         fprintf(stderr, "[GGUF] FATAL: tensor '%s' not in meta context\n", name.c_str());
         exit(1);
     }
-
     int     n_dims;
     int64_t ne[4] = { 1, 1, 1, 1 };
 
@@ -200,14 +363,17 @@ static struct ggml_tensor * gf_load_tensor(WeightCtx *         wctx,
         }
     }
 
-    struct ggml_tensor * tensor = ggml_new_tensor(wctx->ctx, src->type, n_dims, ne);
+    enum ggml_type       type   = gf_lora_hits(gf, { name }) ? gf_lora_type(src->type) : src->type;
+    struct ggml_tensor * tensor = ggml_new_tensor(wctx->ctx, type, n_dims, ne);
     ggml_set_name(tensor, name.c_str());
 
     size_t       offset = gguf_get_tensor_offset(gf.gguf, idx);
     const void * data   = gf.mapping + gf.data_offset + offset;
     size_t       nbytes = ggml_nbytes(src);
 
-    wctx->pending.push_back({ tensor, data, nbytes, 0 });
+    size_t       lora_bytes = 0;
+    const void * merged     = gf_lora_stage(wctx, gf, name, src, data, type, &lora_bytes, type != src->type);
+    wctx->pending.push_back({ tensor, merged ? merged : data, merged ? lora_bytes : nbytes, 0 });
     return tensor;
 }
 
@@ -265,6 +431,13 @@ static struct ggml_tensor * gf_load_tensor_f32(WeightCtx * wctx, const GGUFModel
     const void * raw    = gf.mapping + gf.data_offset + offset;
 
     traits->to_float(raw, data, (int64_t) n);
+    if (g_gf_lora) {
+        size_t lora_bytes = 0;
+        if (const void * merged = gf_lora_stage(wctx, gf, name, src, raw, GGML_TYPE_F32, &lora_bytes, false)) {
+            wctx->pending.push_back({ tensor, merged, lora_bytes, 0 });
+            return tensor;
+        }
+    }
 
     wctx->pending.push_back({ tensor, data, n * sizeof(float), 0 });
     wctx->staging.push_back(std::move(buf));
@@ -296,7 +469,11 @@ static struct ggml_tensor * gf_load_qkv_fused(WeightCtx *         wctx,
     int64_t              ne0       = q_src->ne[0];
     int64_t              fused_ne1 = q_src->ne[1] + k_src->ne[1] + v_src->ne[1];
     int64_t              ne[2]     = { ne0, fused_ne1 };
-    struct ggml_tensor * fused     = ggml_new_tensor(wctx->ctx, q_src->type, 2, ne);
+    enum ggml_type       type      = q_src->type;
+    if (gf_lora_hits(gf, { q_name, k_name, v_name })) {
+        type = gf_lora_type(type);   // Local addition: one type for all three parts
+    }
+    struct ggml_tensor * fused     = ggml_new_tensor(wctx->ctx, type, 2, ne);
 
     size_t row_size = ggml_row_size(q_src->type, ne0);
     size_t q_bytes  = q_src->ne[1] * row_size;
@@ -309,9 +486,23 @@ static struct ggml_tensor * gf_load_qkv_fused(WeightCtx *         wctx,
         return gf.mapping + gf.data_offset + off;
     };
 
-    wctx->pending.push_back({ fused, get_data(q_name), q_bytes, 0 });
-    wctx->pending.push_back({ fused, get_data(k_name), k_bytes, q_bytes });
-    wctx->pending.push_back({ fused, get_data(v_name), v_bytes, q_bytes + k_bytes });
+    if (type != q_src->type) {   // re-typed for a LoRA: every part converted, merged or not
+        size_t out_row = ggml_row_size(type, ne0);
+        gf_lora_push_part(wctx, gf, fused, q_name, q_src, get_data(q_name), type, 0);
+        gf_lora_push_part(wctx, gf, fused, k_name, k_src, get_data(k_name), type, (size_t) q_src->ne[1] * out_row);
+        gf_lora_push_part(wctx, gf, fused, v_name, v_src, get_data(v_name), type,
+                          (size_t) (q_src->ne[1] + k_src->ne[1]) * out_row);
+        return fused;
+    }
+    auto part = [&](const std::string & name, const struct ggml_tensor * src, size_t bytes, size_t at) {
+        size_t       lora_bytes = 0;
+        const void * raw        = get_data(name);
+        const void * merged     = gf_lora_stage(wctx, gf, name, src, raw, src->type, &lora_bytes, false);
+        wctx->pending.push_back({ fused, merged ? merged : raw, merged ? lora_bytes : bytes, at });
+    };
+    part(q_name, q_src, q_bytes, 0);
+    part(k_name, k_src, k_bytes, q_bytes);
+    part(v_name, v_src, v_bytes, q_bytes + k_bytes);
     return fused;
 }
 
@@ -332,7 +523,11 @@ static struct ggml_tensor * gf_load_pair_fused(WeightCtx *         wctx,
 
     int64_t              ne0   = a_src->ne[0];
     int64_t              ne[2] = { ne0, a_src->ne[1] + b_src->ne[1] };
-    struct ggml_tensor * fused = ggml_new_tensor(wctx->ctx, a_src->type, 2, ne);
+    enum ggml_type       type  = a_src->type;
+    if (gf_lora_hits(gf, { a_name, b_name })) {
+        type = gf_lora_type(type);   // Local addition: one type for both parts
+    }
+    struct ggml_tensor * fused = ggml_new_tensor(wctx->ctx, type, 2, ne);
 
     size_t row_size = ggml_row_size(a_src->type, ne0);
     size_t a_bytes  = a_src->ne[1] * row_size;
@@ -344,8 +539,20 @@ static struct ggml_tensor * gf_load_pair_fused(WeightCtx *         wctx,
         return gf.mapping + gf.data_offset + off;
     };
 
-    wctx->pending.push_back({ fused, get_data(a_name), a_bytes, 0 });
-    wctx->pending.push_back({ fused, get_data(b_name), b_bytes, a_bytes });
+    if (type != a_src->type) {   // re-typed for a LoRA: both parts converted, merged or not
+        gf_lora_push_part(wctx, gf, fused, a_name, a_src, get_data(a_name), type, 0);
+        gf_lora_push_part(wctx, gf, fused, b_name, b_src, get_data(b_name), type,
+                          (size_t) a_src->ne[1] * ggml_row_size(type, ne0));
+        return fused;
+    }
+    auto part = [&](const std::string & name, const struct ggml_tensor * src, size_t bytes, size_t at) {
+        size_t       lora_bytes = 0;
+        const void * raw        = get_data(name);
+        const void * merged     = gf_lora_stage(wctx, gf, name, src, raw, src->type, &lora_bytes, false);
+        wctx->pending.push_back({ fused, merged ? merged : raw, merged ? lora_bytes : bytes, at });
+    };
+    part(a_name, a_src, a_bytes, 0);
+    part(b_name, b_src, b_bytes, a_bytes);
     return fused;
 }
 

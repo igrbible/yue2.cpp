@@ -43,8 +43,15 @@ static bool yue2_sampling_valid(const Yue2Sampling & s, const char * stage) {
 }
 
 // Checkpoint native defaults (YuE2-3B/yue2_generation_config.json)
-static const Yue2Sampling YUE2_ABC_SAMPLING      = { 0.7f, 0.9f, 30, 1.005f, 100, 32, 4096 };
-static const Yue2Sampling YUE2_SEMANTIC_SAMPLING = { 1.0f, 0.95f, 100, 1.2f, 50, 200, 9000 };
+// HERESY 1001: max_tokens 4096 → 6144 (партитура), 9000 → 12000 (звук, 8:00).
+// 6144 + 12000 + ~80 служебных оставляют ~6350 токенов на стиль и лирику в
+// окне 24576. 8192 на партитуру съело бы лирику — проверено Виктором.
+// HERESY 1031: Viktor's stable set (01.10.2026, the steadiest takes so far). The release had
+// ABC 0.7 / 0.9 / 30 and semantic 1.0 / 0.95 / 100 / 1.2 / window 50.
+// HERESY 1088 (Viktor, 02.10.2026): floors as fuses. A score may not end before 200 tokens (the broken ones
+// ended at 40 to 54), the music not before 750 (30 s; a shorter requested length lowers it to that length).
+static const Yue2Sampling YUE2_ABC_SAMPLING      = { 0.95f, 0.95f, 50, 1.005f, 100, 200, 6144 };
+static const Yue2Sampling YUE2_SEMANTIC_SAMPLING = { 0.9f, 0.95f, 100, 1.3f, 100, 750, 12000 };
 
 struct Yue2Candidate {
     int   id;

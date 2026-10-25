@@ -62,6 +62,7 @@
 #include "vae.h"
 
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -78,8 +79,12 @@ enum ModelKind {
 
 struct ModelKey {
     ModelKind               kind;
-    std::string             path;      // GGUF path the module is loaded from
-    std::vector<AdapterUse> adapters;  // merged at load, the LM and NAR halves only
+    std::string             path;           // GGUF path the module is loaded from
+    std::vector<AdapterUse> adapters = {};  // upstream: merged at load, the LM and NAR halves only (third, as their { kind, path, adapters })
+    // Local addition: LoRAs merged into this half while it loads. The signature
+    // (files, strengths, mtimes) is part of the key; the set is what gets merged.
+    std::string              lora_sig = {};
+    std::shared_ptr<LoraSet> lora     = {};
 };
 
 enum EvictPolicy {
@@ -114,6 +119,12 @@ void store_release(ModelStore * s, void * handle);
 // evicted: the tokenizer travels with the backbone GGUF metadata (a few
 // MB). Returns NULL on load failure.
 BPETokenizer * store_bpe(ModelStore * s, const char * lm_path);
+
+// Local additions for the console's engine settings: switch the policy at
+// run time (between jobs), and unload every idle module now. Both run on the
+// worker thread, so no module is held while they act.
+void   store_set_policy(ModelStore * s, EvictPolicy policy);
+size_t store_unload_idle(ModelStore * s);
 
 // Observability: sum of currently resident GPU module weight buffers, and
 // the count of loaded GPU modules.
