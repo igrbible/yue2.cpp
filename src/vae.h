@@ -440,6 +440,8 @@ static struct ggml_tensor * vae_ggml_build_graph(struct ggml_context * ctx,
 // A graph that does not fit the device is not an error of the decode: the caller decodes again in smaller tiles.
 static constexpr int VAE_GRAPH_NO_FIT = -2;
 static constexpr int VAE_MIN_CORE     = 64;
+// What the desktop, a browser and the CUDA context usually hold of a card's memory.
+static constexpr size_t VAE_CARD_HEADROOM = (size_t) 768 * 1024 * 1024;
 
 // Whether the graph fits the devices, asked before anything is allocated: a card that takes a graph it has no
 // room for either fails the allocation or, on Windows, spills into the computer's memory and runs many times slower.
@@ -462,12 +464,17 @@ static bool vae_graph_fits(ggml_backend_sched_t sched, struct ggml_cgraph * grap
     ggml_backend_sched_reserve_size(measure, graph, sizes.data());
     bool fits = true;
     for (int i = 0; i < count; ++i) {
-        size_t free_b = 0, total_b = 0;
-        if (ggml_backend_dev_t dev = ggml_backend_get_device(backends[i])) {
+        size_t             free_b = 0, total_b = 0;
+        ggml_backend_dev_t dev    = ggml_backend_get_device(backends[i]);
+        if (dev) {
             ggml_backend_dev_memory(dev, &free_b, &total_b);
         }
         const size_t retained = ggml_backend_sched_get_buffer_size(sched, backends[i]);
-        if (total_b && sizes[i] > retained && sizes[i] - retained > free_b) {
+        // the driver tells a process the room it has itself, not what the desktop and other programs hold on the
+        // card: a card's graph leaves them VAE_CARD_HEADROOM, or it would be taken as fitting and spill
+        const bool   card = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+        const size_t room = card && free_b > VAE_CARD_HEADROOM ? free_b - VAE_CARD_HEADROOM : (card ? 0 : free_b);
+        if (total_b && sizes[i] > retained && sizes[i] - retained > room) {
             fprintf(stderr, "[VAE] Graph needs %.2f GB on %s, %.2f GB free: smaller tiles\n", sizes[i] / 1073741824.0,
                     ggml_backend_name(backends[i]), free_b / 1073741824.0);
             fits = false;
