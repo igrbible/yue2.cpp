@@ -342,11 +342,14 @@ static struct ggml_tensor * vae_conv1d(struct ggml_context * ctx,
         ggml_prec_set_src(y, GGML_PREC_F32, 1);
         y = ggml_reshape_3d(ctx, y, col->ne[1], col->ne[2], w->ne[2]);
         y = ggml_cont(ctx, ggml_permute(ctx, y, 0, 2, 1, 3));
+        y = ggml_reshape_2d(ctx, y, y->ne[0], y->ne[1]);
     } else {
-        y = ggml_conv_1d(ctx, w, x, stride, padding, dilation);
+        // implicit GEMM conv of a one row image, the patches only expand in shared memory: [T, IC] -> [T_out, OC]
+        y =
+            ggml_conv_2d_direct(ctx, ggml_reshape_4d(ctx, w, w->ne[0], 1, w->ne[1], w->ne[2]),
+                                ggml_reshape_4d(ctx, x, x->ne[0], 1, x->ne[1], 1), stride, 1, padding, 0, dilation, 1);
+        y = ggml_reshape_2d(ctx, y, y->ne[0], y->ne[2]);
     }
-    // ggml_conv_1d returns [OL, OC, N=1], squeeze to 2d
-    y                      = ggml_reshape_2d(ctx, y, y->ne[0], y->ne[1]);
     if (b) {
         // bias [OC] -> [1, OC] for broadcast over OL dimension
         struct ggml_tensor * b2d = ggml_reshape_2d(ctx, b, 1, b->ne[0]);
