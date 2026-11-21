@@ -149,9 +149,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.select.outputs.tag }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          packages=(yue2-*.tar.gz yue2-*.zip)
-          test "${#packages[@]}" -gt 0
-          gh release upload "$TAG" "${packages[@]}"
+        run: gh release upload "$TAG" yue2-*.tar.gz yue2-*.zip
