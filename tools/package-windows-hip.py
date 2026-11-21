@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import io
+import re
 import shutil
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
@@ -82,7 +83,7 @@ def pack(args, target):
         for p in sorted((args.sdk / "share/doc").rglob("*")):
             if p.is_file() and any(tag in p.name.lower() for tag in ("license", "notice", "copying")):
                 add_file(out, p, "licenses/rocm/" + p.relative_to(args.sdk / "share/doc").as_posix())
-        manifest = {"gpu_target": args.arch, "rocm": "10.1.0",
+        manifest = {"gpu_target": args.arch, "rocm": "10.1.0", "engine_revision": args.engine_revision,
                     "engine_sha256": hashlib.sha256((args.engine / "yue-server.exe").read_bytes()).hexdigest()}
         add_stream(out, "BUILD.json", io.BytesIO(json.dumps(manifest, indent=2).encode()))
 
@@ -93,7 +94,10 @@ if __name__ == "__main__":
     for key in ("engine", "sdk", "openmp", "crt", "libraries", "device", "out"):
         parser.add_argument("--" + key, type=Path, required=True)
     parser.add_argument("--arch", choices=DEVICE, required=True)
+    parser.add_argument("--engine-revision", required=True, help="Full Git SHA of the prebuilt engine")
     a = parser.parse_args()
+    if not re.fullmatch(r"[0-9a-f]{40}", a.engine_revision):
+        parser.error("--engine-revision must be the 40-character source SHA")
     a.out.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=a.out.parent, delete=False, suffix=".zip") as handle:
         temp = Path(handle.name)

@@ -61,7 +61,7 @@ jobs:
           if (!$crt) { throw "MSVC 14.44 redistributable missing" }
           foreach ($arch in 'gfx1036','gfx1100') {
             $zip = "packages/yue2-windows-$arch.zip"
-            python tools/package-windows-hip.py --engine engine --openmp engine --sdk sdk/_rocm_sdk_core --crt $crt.FullName --device "rocm-sdk-device-$arch.whl" --libraries rocm-sdk-libraries.whl --arch $arch --out $zip
+            python tools/package-windows-hip.py --engine engine --engine-revision $env:ENGINE_SHA --openmp engine --sdk sdk/_rocm_sdk_core --crt $crt.FullName --device "rocm-sdk-device-$arch.whl" --libraries rocm-sdk-libraries.whl --arch $arch --out $zip
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
             $hash = (Get-FileHash $zip).Hash
             "engine $env:ENGINE_SHA | $arch | $((Get-Item $zip).Length) bytes | SHA-256 $hash" >> $env:GITHUB_STEP_SUMMARY
