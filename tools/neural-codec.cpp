@@ -385,6 +385,12 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             planar = (float *) malloc((size_t) T_rs * 2 * sizeof(float));
+            if (!planar) {
+                fprintf(stderr, "[VAE] FATAL: cannot allocate resampled stereo audio\n");
+                free(left);
+                free(right);
+                return 1;
+            }
             memcpy(planar, left, (size_t) T_rs * sizeof(float));
             memcpy(planar + T_rs, right, (size_t) T_rs * sizeof(float));
             free(left);
