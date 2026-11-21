@@ -985,14 +985,15 @@ int main(int argc, char ** argv) {
     // a recording comes whole in one request body: an hour of 32-bit stereo at 48 kHz is 1.4 GB
     svr.set_payload_max_length((size_t) 2 * 1024 * 1024 * 1024);
 
-    // SO_REUSEADDR lets us rebind a port still in TIME_WAIT after a restart.
+    // Unix allows rebinding after TIME_WAIT. Windows needs exclusive addressing
+    // to stop a second live server from sharing the same listener.
     // SO_REUSEPORT is deliberately not set: a second instance on the same port
     // then fails with EADDRINUSE instead of silently sharing the socket and
     // splitting traffic between two daemons.
     svr.set_socket_options([](socket_t sock) {
         int one = 1;
 #ifdef _WIN32
-        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *) &one, sizeof(one));
+        setsockopt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char *>(&one), sizeof(one));
 #else
         setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 #endif
