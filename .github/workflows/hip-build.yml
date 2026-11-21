@@ -10,7 +10,10 @@ permissions:
   contents: read
 
 jobs:
+  openmp:
+    uses: ./.github/workflows/hip-openmp.yml
   build:
+    needs: openmp
     runs-on: windows-latest
     timeout-minutes: 90
     env:
@@ -41,11 +44,16 @@ jobs:
         run: |
           call buildhip.cmd
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x64-llvm-openmp
+          path: build-hip
+
       - name: Contract check
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          foreach ($file in @('yue-server.exe','ggml-hip.dll','ggml.dll','ggml-base.dll','ggml-cpu-x64.dll','ggml-cpu-haswell.dll','ggml-cpu-skylakex.dll')) {
+          foreach ($file in @('yue-server.exe','ggml-hip.dll','ggml.dll','ggml-base.dll','ggml-cpu-x64.dll','ggml-cpu-haswell.dll','ggml-cpu-skylakex.dll','libomp140.x86_64.dll','LICENSE-LLVM-OpenMP.txt')) {
             if (-not (Test-Path (Join-Path build-hip $file))) { throw "Missing $file" }
           }
           $cache = Get-Content build-hip/CMakeCache.txt
@@ -59,4 +67,5 @@ jobs:
           path: |
             build-hip/yue-server.exe
             build-hip/*.dll
+            build-hip/LICENSE-LLVM-OpenMP.txt
           retention-days: 7
