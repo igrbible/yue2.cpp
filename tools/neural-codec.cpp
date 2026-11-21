@@ -181,14 +181,18 @@ static float * read_latent(const char * path, int * T_latent) {
             fclose(f);
             return nullptr;
         }
-        long frame    = q8 ? NAC8_FRAME : NAC4_FRAME;
-        long expected = (q8 ? NAC8_HEADER : NAC4_HEADER) + (long) t * frame;
-        if (size != expected) {
-            fprintf(stderr, "[VAE] FATAL: %s size %ld, expected %ld for %u frames\n", path, size, expected, t);
+        const long frame  = q8 ? NAC8_FRAME : NAC4_FRAME;
+        const long header = q8 ? NAC8_HEADER : NAC4_HEADER;
+        if (!t || size < header || (size - header) % frame != 0 || (size - header) / frame != t) {
+            fprintf(stderr, "[VAE] FATAL: %s size %ld does not match %u frames\n", path, size, t);
             fclose(f);
             return nullptr;
         }
         float * data = (float *) malloc((size_t) t * LATENT_CH * sizeof(float));
+        if (!data) {
+            fclose(f);
+            return nullptr;
+        }
         for (uint32_t i = 0; i < t; i++) {
             ggml_fp16_t scale_f16;
             if (fread(&scale_f16, 2, 1, f) != 1) {
@@ -231,7 +235,7 @@ static float * read_latent(const char * path, int * T_latent) {
 
     // Raw f32, rewind past the magic probe
     long frame_bytes = (long) LATENT_CH * sizeof(float);
-    if (size % frame_bytes != 0) {
+    if (size <= 0 || size % frame_bytes != 0) {
         fprintf(stderr, "[VAE] FATAL: %s size %ld is not a multiple of %ld\n", path, size, frame_bytes);
         fclose(f);
         return nullptr;
@@ -239,7 +243,7 @@ static float * read_latent(const char * path, int * T_latent) {
     fseek(f, 0, SEEK_SET);
     *T_latent    = (int) (size / frame_bytes);
     float * data = (float *) malloc((size_t) size);
-    if (fread(data, 1, (size_t) size, f) != (size_t) size) {
+    if (!data || fread(data, 1, (size_t) size, f) != (size_t) size) {
         free(data);
         fclose(f);
         return nullptr;
