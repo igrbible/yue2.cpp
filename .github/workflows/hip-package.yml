@@ -8,7 +8,7 @@ on:
         type: string
   push:
     branches: [music-round/native-hip-current]
-    paths: [.github/workflows/hip-package.yml, tools/package-windows-hip.py]
+    paths: [.github/workflows/hip-package.yml, tools/package-windows-hip.py, tools/windows-hip-notices.txt]
 
 permissions:
   contents: read

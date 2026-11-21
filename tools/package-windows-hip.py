@@ -61,6 +61,7 @@ def pack(args, target):
         add_file(out, args.openmp / "libomp140.x86_64.dll", "bin/libomp140.x86_64.dll")
         add_file(out, args.openmp / "LICENSE-LLVM-OpenMP.txt", "licenses/LICENSE-LLVM-OpenMP.txt")
         add_file(out, Path(__file__).resolve().parents[1] / "LICENSE", "licenses/LICENSE-YuE2")
+        add_file(out, Path(__file__).with_name("windows-hip-notices.txt"), "licenses/THIRD-PARTY-NOTICES.txt")
         for name in ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
             add_file(out, args.crt / name, "bin/" + name)
         for name in CORE:
