@@ -67,7 +67,9 @@ jobs:
           cppcheck --enable=all --inline-suppr \
             --template='{file}:{line}:{column}: {severity}: {message} [{id}]' \
             -I . -I src -I ggml/include -I vendor/yyjson src tools tests 2>&1 | tee cppcheck-first-party.log
-          if grep -Eq ': (error|warning):' cppcheck-first-party.log; then
+          # Included third-party headers can emit findings even when checking a first-party unit.
+          if grep -E '^[^:]+:[0-9]+:[0-9]+: (error|warning):' cppcheck-first-party.log |
+              grep -Ev '^(vendor|mp3|ggml)/'; then
             echo 'First-party cppcheck errors or warnings must be resolved.' >&2
             exit 1
           fi
