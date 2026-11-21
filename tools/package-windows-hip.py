@@ -2,8 +2,10 @@
 import argparse
 import hashlib
 import json
+import io
+import shutil
 from pathlib import Path
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 # Official AMD 10.1.0 Windows wheels. The core DLLs come from the matching SDK.
 DEVICE = {
@@ -27,6 +29,21 @@ def verify(file, expected):
         raise ValueError(f"Wrong SHA-256 for {file.name}: {actual}")
 
 
+def add_stream(archive, name, source):
+    # Identical component inputs must have the same update digest on any host.
+    entry = ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+    entry.create_system = 3
+    entry.external_attr = 0o100644 << 16
+    entry.compress_type = ZIP_DEFLATED
+    with archive.open(entry, "w") as dest:
+        shutil.copyfileobj(source, dest)
+
+
+def add_file(archive, file, name):
+    with file.open("rb") as source:
+        add_stream(archive, name, source)
+
+
 def pack(args, target):
     verify(args.libraries, LIBRARIES)
     verify(args.device, DEVICE[args.arch])
@@ -39,31 +56,35 @@ def pack(args, target):
     lib_names = ("hipblas.dll", "rocblas.dll", "rocsolver.dll", "libhipblaslt.dll", "origami.dll")
     with ZipFile(target, "w", compression=ZIP_DEFLATED, compresslevel=3) as out:
         for p in cpus + [args.engine / n for n in ("ggml.dll", "ggml-base.dll", "ggml-hip.dll", "yue-server.exe")]:
-            out.write(p, "bin/" + p.name)
-        out.write(args.openmp / "libomp140.x86_64.dll", "bin/libomp140.x86_64.dll")
-        out.write(args.openmp / "LICENSE-LLVM-OpenMP.txt", "licenses/LICENSE-LLVM-OpenMP.txt")
-        out.write(Path(__file__).resolve().parents[1] / "LICENSE", "licenses/LICENSE-YuE2")
+            add_file(out, p, "bin/" + p.name)
+        add_file(out, args.openmp / "libomp140.x86_64.dll", "bin/libomp140.x86_64.dll")
+        add_file(out, args.openmp / "LICENSE-LLVM-OpenMP.txt", "licenses/LICENSE-LLVM-OpenMP.txt")
+        add_file(out, Path(__file__).resolve().parents[1] / "LICENSE", "licenses/LICENSE-YuE2")
         for name in ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
-            out.write(args.crt / name, "bin/" + name)
+            add_file(out, args.crt / name, "bin/" + name)
         for name in CORE:
-            out.write(args.sdk / "bin" / name, "bin/" + name)
+            add_file(out, args.sdk / "bin" / name, "bin/" + name)
         # Preserve the SDK layout: the driver locates .kpack relative to bin.
         with ZipFile(args.libraries) as libs:
             for name in lib_names:
-                out.writestr("bin/" + name, libs.read("_rocm_sdk_libraries/bin/" + name))
+                with libs.open("_rocm_sdk_libraries/bin/" + name) as src:
+                    add_stream(out, "bin/" + name, src)
         with ZipFile(args.device) as device:
             prefix = "_rocm_sdk_libraries/"
             kpack = f".kpack/blas_lib_{args.arch}.kpack"
             for entry in device.infolist():
                 rel = entry.filename.removeprefix(prefix)
                 if not entry.is_dir() and (rel == kpack or rel.startswith(("bin/rocblas/library/", "bin/hipblaslt/library/"))):
-                    out.writestr(rel, device.read(entry))
+                    with device.open(entry) as src:
+                        add_stream(out, rel, src)
             if kpack not in out.namelist() or not any(n.startswith("bin/rocblas/library/") for n in out.namelist()):
                 raise ValueError(f"Incomplete BLAS device files for {args.arch}")
         for p in sorted((args.sdk / "share/doc").rglob("*")):
             if p.is_file() and any(tag in p.name.lower() for tag in ("license", "notice", "copying")):
-                out.write(p, "licenses/rocm/" + p.relative_to(args.sdk / "share/doc").as_posix())
-        out.writestr("BUILD.json", json.dumps({"gpu_target": args.arch, "rocm": "10.1.0", "engine_sha256": hashlib.sha256((args.engine / "yue-server.exe").read_bytes()).hexdigest()}, indent=2))
+                add_file(out, p, "licenses/rocm/" + p.relative_to(args.sdk / "share/doc").as_posix())
+        manifest = {"gpu_target": args.arch, "rocm": "10.1.0",
+                    "engine_sha256": hashlib.sha256((args.engine / "yue-server.exe").read_bytes()).hexdigest()}
+        add_stream(out, "BUILD.json", io.BytesIO(json.dumps(manifest, indent=2).encode()))
 
 
 if __name__ == "__main__":
