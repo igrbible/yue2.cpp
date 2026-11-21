@@ -46,6 +46,8 @@ jobs:
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install lint tools
         run: |
@@ -62,7 +64,9 @@ jobs:
       - name: Run cppcheck on first-party code
         run: |
           set -euo pipefail
-          cppcheck --enable=all --inline-suppr --template=gcc src tools tests 2>&1 | tee cppcheck-first-party.log
+          cppcheck --enable=all --inline-suppr \
+            --template='{file}:{line}:{column}: {severity}: {message} [{id}]' \
+            -I . -I src -I ggml/include -I vendor/yyjson src tools tests 2>&1 | tee cppcheck-first-party.log
           if grep -Eq ': (error|warning):' cppcheck-first-party.log; then
             echo 'First-party cppcheck errors or warnings must be resolved.' >&2
             exit 1
@@ -72,7 +76,8 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          cppcheck --enable=all --template=gcc vendor mp3 2>&1 | tee cppcheck-vendor.log
+          cppcheck --enable=all --template='{file}:{line}:{column}: {severity}: {message} [{id}]' \
+            vendor mp3 2>&1 | tee cppcheck-vendor.log
 
       - uses: actions/upload-artifact@v4
         if: always()

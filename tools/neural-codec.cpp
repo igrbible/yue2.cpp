@@ -147,7 +147,7 @@ static bool write_latent_q4(const char * path, const float * data, int T_latent)
             int   hi  = (int) (vhi < 0 ? vhi - 0.5f : vhi + 0.5f);
             lo        = lo < -7 ? -7 : (lo > 7 ? 7 : lo);
             hi        = hi < -7 ? -7 : (hi > 7 ? 7 : hi);
-            packed[j] = (uint8_t) ((lo & 0x0F) | (hi << 4));
+            packed[j] = (uint8_t) ((lo & 0x0F) | ((hi & 0x0F) << 4));
         }
         fwrite(packed, 1, LATENT_CH / 2, f);
     }
