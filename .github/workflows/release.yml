@@ -61,6 +61,12 @@ jobs:
         with:
           version: 1.4.309.0
           cache: true
+      - if: runner.os == 'Windows'
+        uses: actions/checkout@v4
+        with:
+          repository: KhronosGroup/SPIRV-Headers
+          ref: 09913f088a1197aba4aefd300a876b2ebbaa3391 # vulkan-sdk-1.4.309.0
+          path: spirv-headers
       - name: Configure, build, and stage
         shell: bash
         env:
@@ -77,6 +83,11 @@ jobs:
                     -DGGML_CUDA=ON -DGGML_CUDA_NCCL=OFF -DGGML_CUDA_FA_QUANTS=all -DGGML_VULKAN=ON)
             if [[ "$RUNNER_OS" == Linux ]]; then
               flags+=(-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON '-DCMAKE_INSTALL_RPATH=$ORIGIN')
+            else
+              spirv_prefix="$(pwd -W)/spirv-headers-install"
+              cmake -S spirv-headers -B spirv-headers-build -G Ninja
+              cmake --install spirv-headers-build --prefix "$spirv_prefix"
+              flags+=("-DCMAKE_PREFIX_PATH=$spirv_prefix")
             fi
           fi
           cmake -S . -B build "${flags[@]}"
