@@ -23,6 +23,7 @@
 #include "nar.h"
 #include "request.h"
 #include "score-check.h"
+#include "score-wordless.h"
 #include "timer.h"
 #include "torch-cpu-rng.h"
 #include "vae-enc.h"
@@ -725,6 +726,13 @@ static bool pipeline_generate(Yue2Pipeline *          p,
                                            : "Adapters past their limits on the score half do this: lower their "
                                              "strengths or draw another seed.");
                 return false;
+            }
+            std::string quiet = yue2_score_silence_unsung(scores[i], r.lyrics);
+            if (quiet != scores[i]) {
+                fprintf(stderr, "[Pipeline] song %d: sections the lyrics leave without words keep the vocal voice resting\n",
+                        i + 1);
+                scores[i]  = quiet;
+                abc_ids[i] = bpe_encode(tok, quiet);
             }
         }
     }
